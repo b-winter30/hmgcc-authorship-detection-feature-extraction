@@ -11,3 +11,4 @@ wheels/
 models/
 models_prev/
 model_cache/
+visualizations/

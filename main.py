@@ -11,11 +11,12 @@ from pydantic import BaseModel, Field
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TypedDict
 from datetime import datetime
 import numpy as np
 import time
 import re
+import torch
 from sentence_transformers import SentenceTransformer
 from langdetect import detect, LangDetectException
 import pickle
@@ -82,6 +83,14 @@ app.add_middleware(
 extractor = StylometricExtractor()
 
 sentence_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+from transformers import pipeline as hf_pipeline
+
+tonal_classifier = hf_pipeline(
+    "zero-shot-classification",
+    model="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",   # ~110MB, fast
+    device=0 if torch.cuda.is_available() else -1,
+)
 
 # Global variables for ML models
 MODELS_LOADED = False
@@ -208,6 +217,7 @@ async def startup_event():
     """Load ML models when FastAPI starts"""
     load_models("models")
     initialize_extractor_with_ntp()
+    initialize_tonal_classifier()
 
 from sklearn.manifold import TSNE
 
@@ -223,6 +233,9 @@ projection_model = None
 projected_training_data = None
 projection_method = None
 
+class TonalScore(TypedDict):
+    label: str
+    score: float
 
 class VisualizationRequest(BaseModel):
     content: str
@@ -278,11 +291,32 @@ class SentenceOutlierRequest(BaseModel):
 
 class SentenceOutlierResponse(BaseModel):
     total_sentences: int
-    outlier_count: int
-    sentences: List[Dict]  # All sentences with their influence scores
-    skipped: bool  # True if email was too short
+    outlier_count: int          # semantic outliers only (backward compat)
+    suspicious_count: int       # combined semantic + tonal
+    sentences: List[Dict]
+    skipped: bool
     skip_reason: Optional[str] = None
+    tonal_summary: Optional[str] = None     # e.g. "Dominant tone: sympathy. 1 sentence anomalous."
     summary: str
+
+class SentenceResult(TypedDict):
+    index: int
+    sentence: str
+    # --- semantic leave-one-out scores (existing) ---
+    influence_distance: float
+    context_distance: float
+    combined_score: float
+    z_score: float
+    is_outlier: bool
+    # --- tonal consistency scores (new) ---
+    tonal_scores: List[TonalScore]          # all label probabilities
+    dominant_tone: str                       # highest-scoring label
+    tonal_z_score: float                     # deviation vs email's modal tone
+    tonal_is_anomaly: bool                   # True if tone differs from majority
+    tonal_flag: Optional[str]                # human-readable reason if anomalous
+    # --- combined suspicion (new) ---
+    suspicion_score: float                   # weighted blend of semantic + tonal
+    is_suspicious: bool 
 
 class FeatureResponse(BaseModel):
     features: Optional[Dict[str, float]] = None
@@ -320,6 +354,55 @@ class PredictResponse(BaseModel):
     method: str
     message: str
 
+class SentenceAnalysisRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+    min_sentences: int = Field(default=5, ge=3)
+    language: str = Field(default="auto")
+
+class SemanticSentenceResult(BaseModel):
+    index: int
+    sentence: str
+    influence_distance: float
+    context_distance: float
+    combined_score: float
+    z_score: float
+    is_outlier: bool
+    suspicion_score: float          # normalised 0–1
+
+
+class SemanticOutlierResponse(BaseModel):
+    total_sentences: int
+    outlier_count: int
+    threshold: float
+    sentences: List[Dict]
+    skipped: bool
+    skip_reason: Optional[str] = None
+    summary: str
+
+
+# ── Tonal models ─────────────────────────────────────────────────────────────
+
+class TonalSentenceResult(BaseModel):
+    index: int
+    sentence: str
+    tonal_scores: List[Dict]        # [{label, score}, ...]
+    dominant_tone: str
+    modal_tone: str
+    jsd_score: float
+    tonal_z_score: float
+    tonal_is_anomaly: bool
+    tonal_flag: Optional[str]
+    suspicion_score: float          # normalised 0–1
+
+
+class TonalOutlierResponse(BaseModel):
+    total_sentences: int
+    anomaly_count: int
+    modal_tone: str
+    sentences: List[Dict]
+    skipped: bool
+    skip_reason: Optional[str] = None
+    summary: str
 
 class HealthResponse(BaseModel):
     status: str
@@ -340,6 +423,7 @@ class NTPVisualizationRequest(BaseModel):
     content: str
     max_length: int = 512
     language: str = "auto"
+
 
 # Helper Functions
 def detect_language(text: str, fallback: str = "en") -> str:
@@ -374,6 +458,146 @@ def split_sentences(text: str) -> List[str]:
                 sentences.append(part)
 
     return sentences
+
+def _compute_jsd_tonal_scores(
+    tonal_scores_per_sentence: List[Dict[str, float]]
+) -> List[Dict]:
+    from scipy.spatial.distance import jensenshannon
+    from collections import Counter
+
+    label_order = TONAL_LABELS
+    n = len(tonal_scores_per_sentence)
+
+    # Build distribution matrix [n_sentences x n_labels]
+    dist_matrix = np.array([
+        [s.get(label, 0.0) for label in label_order]
+        for s in tonal_scores_per_sentence
+    ], dtype=float)
+
+    # Normalise each row — if a row sums to 0 (empty dict fallback),
+    # replace with uniform distribution so JSD doesn't produce NaN
+    row_sums = dist_matrix.sum(axis=1, keepdims=True)
+    zero_rows = (row_sums == 0).flatten()
+    dist_matrix[zero_rows] = 1.0 / len(label_order)
+    dist_matrix = dist_matrix / dist_matrix.sum(axis=1, keepdims=True)
+
+    # Mean distribution across the email
+    email_mean = dist_matrix.mean(axis=0)
+    email_mean = email_mean / (email_mean.sum() + 1e-8)
+
+    # JSD between each sentence and the email mean
+    jsd_scores = []
+    for row in dist_matrix:
+        jsd = float(jensenshannon(row, email_mean))
+        # jensenshannon returns NaN if either input has zeros in same position
+        # after scipy normalises — guard against it
+        if np.isnan(jsd):
+            jsd = 0.0
+        jsd_scores.append(jsd)
+
+    # Z-score within this email
+    jsd_mean = float(np.mean(jsd_scores))
+    jsd_std = float(np.std(jsd_scores))
+
+    # If std is near zero all sentences have identical tone distributions —
+    # nothing is anomalous, avoid division producing inf/nan
+    if jsd_std < 1e-6:
+        jsd_z_scores = [0.0] * n
+    else:
+        jsd_z_scores = [(s - jsd_mean) / jsd_std for s in jsd_scores]
+
+    # Dominant tone per sentence (for display only)
+    dominant_tones = [
+        max(s, key=s.get) if s else "informational"
+        for s in tonal_scores_per_sentence
+    ]
+
+    tone_counts = Counter(dominant_tones)
+    modal_tone = tone_counts.most_common(1)[0][0] if tone_counts else "informational"
+
+    results = []
+    for i in range(n):
+        z = float(jsd_z_scores[i])
+        is_anomaly = bool(z > 2.0)
+        flag = None
+        if is_anomaly:
+            dom = dominant_tones[i]
+            flag = f"Tone shift: '{dom}' diverges from email's '{modal_tone}' register (JSD z={z:.1f})"
+
+        results.append({
+            "jsd_score": round(jsd_scores[i], 4),
+            "tonal_z_score": round(z, 2),
+            "dominant_tone": dominant_tones[i],
+            "modal_tone": modal_tone,
+            "tonal_is_anomaly": is_anomaly,
+            "tonal_flag": flag,
+        })
+
+    return results
+
+def initialize_tonal_classifier():
+    """Load zero-shot classifier at startup. Call from startup_event()."""
+    global tonal_classifier
+    try:
+        import torch
+        from transformers import pipeline as hf_pipeline
+        device = 0 if torch.cuda.is_available() else -1
+        tonal_classifier = hf_pipeline(
+            "zero-shot-classification",
+            model="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            device=device,
+        )
+        logger.info("✅ Tonal classifier loaded (MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7)")
+    except Exception as e:
+        logger.warning(f"⚠️  Tonal classifier not available: {e}. Tonal scoring will be skipped.")
+        tonal_classifier = None
+
+
+# Global — set to None until initialize_tonal_classifier() runs
+tonal_classifier = None
+
+TONAL_LABELS = [
+    "sympathy or emotional support",   # "so sorry about your back"
+    "social or phatic",                # "hope you're well", greetings
+    "informational",                   # stating facts
+    "directive or request",            # asking someone to do something
+    "financial or transactional",      # money, payment, wire, send funds
+    "threat or urgency",               # act now, don't tell anyone
+    "urgent account action required",
+    "requesting confidential data or passwords",  # lost credentials, please send documents.             
+    "claiming authority or permission from someone"      # "I am the police"    
+]
+
+
+def _classify_tone(sentences: List[str]) -> List[Dict[str, float]]:
+    """
+    Run zero-shot classification on each sentence.
+    Returns a list of {label: score} dicts, one per sentence.
+    Falls back to empty dicts if classifier is unavailable.
+    """
+    if tonal_classifier is None:
+        return [{} for _ in sentences]
+
+    try:
+        results = tonal_classifier(
+            sentences,
+            candidate_labels=TONAL_LABELS,
+            multi_label=False,
+        )
+        # results is a list when input is a list
+        if not isinstance(results, list):
+            results = [results]
+
+        output = []
+        for r in results:
+            scores = dict(zip(r["labels"], r["scores"]))
+            output.append(scores)
+        return output
+
+    except Exception as e:
+        logger.warning(f"Tonal classification failed: {e}")
+        return [{} for _ in sentences]
+
 
 # API Endpoints
 @app.get("/", response_model=HealthResponse)
@@ -605,55 +829,58 @@ async def predict_author(request: PredictRequest):
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-@app.post("/sentence-outlier-detection", response_model=SentenceOutlierResponse)
-async def sentence_outlier_detection(request: SentenceOutlierRequest):
+@app.post("/semantic-outlier-detection", response_model=SemanticOutlierResponse)
+async def semantic_outlier_detection(request: SentenceAnalysisRequest):
     """
-    Detect semantically anomalous sentences using leave-one-out embedding analysis.
+    Stage 5 — Semantic leave-one-out analysis.
 
-    For each sentence, we compute how much removing it shifts the overall
-    email embedding. Sentences that cause a large shift when removed are
-    semantically distant from the rest of the email — potential injections.
+    Measures how much removing each sentence shifts the full-email
+    embedding. Good at detecting topically foreign content (e.g. a
+    paragraph about wire transfers injected into a birthday email).
     """
     try:
         sentences = split_sentences(request.content)
 
-        # Check minimum sentence count
         if len(sentences) < request.min_sentences:
-            return SentenceOutlierResponse(
+            return SemanticOutlierResponse(
                 total_sentences=len(sentences),
                 outlier_count=0,
+                threshold=0.0,
                 sentences=[],
                 skipped=True,
-                skip_reason=f"Email has {len(sentences)} sentences, minimum is {request.min_sentences}",
-                summary=f"Skipped — email too short ({len(sentences)} sentences, need {request.min_sentences})",
+                skip_reason=(
+                    f"Email has {len(sentences)} sentences, "
+                    f"minimum is {request.min_sentences}"
+                ),
+                summary=(
+                    f"Skipped — email too short "
+                    f"({len(sentences)} sentences, need {request.min_sentences})"
+                ),
             )
 
-        # Encode the full email as a single embedding
+        # Full-email embedding
         full_text = " ".join(sentences)
         full_embedding = sentence_model.encode(full_text, normalize_embeddings=True)
 
-        # For each sentence, encode the email WITHOUT that sentence
-        results = []
+        rows = []
         for i, sentence in enumerate(sentences):
             remaining = sentences[:i] + sentences[i + 1:]
             remaining_text = " ".join(remaining)
-            remaining_embedding = sentence_model.encode(remaining_text, normalize_embeddings=True)
+            remaining_embedding = sentence_model.encode(
+                remaining_text, normalize_embeddings=True
+            )
+            sentence_embedding = sentence_model.encode(
+                sentence, normalize_embeddings=True
+            )
 
-            # Also encode the sentence alone for bidirectional comparison
-            sentence_embedding = sentence_model.encode(sentence, normalize_embeddings=True)
-
-            # Euclidean distance: how much does removing this sentence shift the embedding?
-            influence_distance = float(np.linalg.norm(full_embedding - remaining_embedding))
-
-            # Cosine distance between the sentence alone and the rest of the email
+            influence_distance = float(
+                np.linalg.norm(full_embedding - remaining_embedding)
+            )
             cos_sim = float(np.dot(sentence_embedding, remaining_embedding))
-            context_distance = 1.0 - cos_sim  # Convert similarity to distance
-
-            # Combined score: average of influence and context distance
-            # Influence = how much it shifts the whole; context = how different it is from the rest
+            context_distance = 1.0 - cos_sim
             combined_score = (influence_distance + context_distance) / 2.0
 
-            results.append({
+            rows.append({
                 "index": i,
                 "sentence": sentence,
                 "influence_distance": round(influence_distance, 4),
@@ -661,53 +888,165 @@ async def sentence_outlier_detection(request: SentenceOutlierRequest):
                 "combined_score": round(combined_score, 4),
             })
 
-        # Compute outlier threshold using IQR on combined scores
-        scores = [r["combined_score"] for r in results]
+        # IQR-based outlier threshold
+        scores = [r["combined_score"] for r in rows]
         q1 = float(np.percentile(scores, 25))
         q3 = float(np.percentile(scores, 75))
         iqr = q3 - q1
         outlier_threshold = q3 + 1.5 * iqr
-
-        # Mark outliers and compute z-scores relative to the email's own sentences
         mean_score = float(np.mean(scores))
         std_score = float(np.std(scores))
 
-        for r in results:
+        for r in rows:
             z = (r["combined_score"] - mean_score) / (std_score + 1e-8)
             r["z_score"] = round(float(z), 2)
             r["is_outlier"] = bool(r["combined_score"] > outlier_threshold)
+            r["suspicion_score"] = round(
+                min(max(z / 4.0 if z > 0 else 0.0, 0.0), 1.0), 4
+            )
 
-        # Sort by combined score descending (most anomalous first)
-        results.sort(key=lambda x: x["combined_score"], reverse=True)
+        outlier_count = sum(1 for r in rows if r["is_outlier"])
 
-        outlier_count = sum(1 for r in results if r["is_outlier"])
+        # Sort by suspicion descending
+        rows.sort(key=lambda x: x["suspicion_score"], reverse=True)
 
-        # Generate summary
+        # Summary
         if outlier_count == 0:
-            summary = "All sentences are semantically consistent with each other."
+            summary = "No semantic outliers — all sentences are topically consistent."
         elif outlier_count == 1:
-            top = results[0]
-            preview = top["sentence"][:60] + "..." if len(top["sentence"]) > 60 else top["sentence"]
-            summary = f"1 sentence appears semantically inconsistent: \"{preview}\""
+            top = next(r for r in rows if r["is_outlier"])
+            preview = top["sentence"][:60] + ("..." if len(top["sentence"]) > 60 else "")
+            summary = f'1 semantic outlier: "{preview}" (z={top["z_score"]:.1f})'
         else:
-            summary = f"{outlier_count} sentences appear semantically inconsistent with the rest of the email."
+            summary = f"{outlier_count} semantic outliers detected (threshold z > IQR×1.5)."
 
-        logger.info(f"Sentence outlier detection: {len(sentences)} sentences, "
-                     f"{outlier_count} outliers (threshold={outlier_threshold:.4f})")
+        logger.info(
+            f"Semantic analysis: {len(sentences)} sentences, "
+            f"{outlier_count} outliers, threshold={outlier_threshold:.4f}"
+        )
 
-        return SentenceOutlierResponse(
+        return SemanticOutlierResponse(
             total_sentences=len(sentences),
             outlier_count=outlier_count,
-            sentences=results,
+            threshold=round(outlier_threshold, 4),
+            sentences=rows,
             skipped=False,
             summary=summary,
         )
 
     except Exception as e:
-        logger.error(f"Sentence outlier detection error: {e}")
+        logger.error(f"Semantic outlier detection error: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Sentence outlier detection failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Semantic outlier detection failed: {str(e)}"
+        )
+
+
+# ── Endpoint 2: Tonal consistency ────────────────────────────────────────────
+
+@app.post("/tonal-outlier-detection", response_model=TonalOutlierResponse)
+async def tonal_outlier_detection(request: SentenceAnalysisRequest):
+    """
+    Stage 6 — Tonal consistency analysis (JSD-based).
+
+    Classifies each sentence into discourse categories (sympathy, social,
+    informational, directive, financial, threat) and flags sentences whose
+    register diverges from the email's dominant tone.
+
+    Good at detecting social-engineering injections that are semantically
+    plausible but tonally out of place (e.g. a money request appended to
+    a sympathetic personal email).
+    """
+    try:
+        sentences = split_sentences(request.content)
+
+        if len(sentences) < request.min_sentences:
+            return TonalOutlierResponse(
+                total_sentences=len(sentences),
+                anomaly_count=0,
+                modal_tone="unknown",
+                sentences=[],
+                skipped=True,
+                skip_reason=(
+                    f"Email has {len(sentences)} sentences, "
+                    f"minimum is {request.min_sentences}"
+                ),
+                summary=(
+                    f"Skipped — email too short "
+                    f"({len(sentences)} sentences, need {request.min_sentences})"
+                ),
+            )
+
+        # Classify each sentence
+        tonal_scores_per_sentence = _classify_tone(sentences)
+        jsd_results = _compute_jsd_tonal_scores(tonal_scores_per_sentence)
+
+        rows = []
+        for i, (scores_dict, jsd) in enumerate(zip(tonal_scores_per_sentence, jsd_results)):
+            z = jsd["tonal_z_score"]
+            rows.append({
+                "index": i,
+                "sentence": sentences[i],
+                "tonal_scores": [
+                    {"label": k, "score": round(v, 4)}
+                    for k, v in sorted(
+                        scores_dict.items(), key=lambda x: x[1], reverse=True
+                    )
+                ],
+                "dominant_tone": jsd["dominant_tone"],
+                "modal_tone": jsd["modal_tone"],
+                "jsd_score": jsd["jsd_score"],
+                "tonal_z_score": jsd["tonal_z_score"],
+                "tonal_is_anomaly": jsd["tonal_is_anomaly"],
+                "tonal_flag": jsd["tonal_flag"],
+                "suspicion_score": round(
+                    min(max(z / 4.0 if z > 0 else 0.0, 0.0), 1.0), 4
+                ),
+            })
+
+        modal_tone = jsd_results[0]["modal_tone"] if jsd_results else "informational"
+        anomaly_count = sum(1 for r in rows if r["tonal_is_anomaly"])
+
+        # Sort by suspicion descending
+        rows.sort(key=lambda x: x["suspicion_score"], reverse=True)
+
+        # Summary
+        anomalies = [r for r in rows if r["tonal_is_anomaly"]]
+        if anomalies:
+            worst = max(anomalies, key=lambda r: r["tonal_z_score"])
+            preview = worst["sentence"][:60] + ("..." if len(worst["sentence"]) > 60 else "")
+            summary = (
+                f"Dominant tone: '{modal_tone}'. "
+                f"{anomaly_count} sentence(s) break register. "
+                f'Most anomalous: "{preview}"'
+            )
+        else:
+            summary = f"Dominant tone: '{modal_tone}'. All sentences tonally consistent."
+
+        logger.info(
+            f"Tonal analysis: {len(sentences)} sentences, "
+            f"modal_tone='{modal_tone}', {anomaly_count} anomalies"
+        )
+
+        return TonalOutlierResponse(
+            total_sentences=len(sentences),
+            anomaly_count=anomaly_count,
+            modal_tone=modal_tone,
+            sentences=rows,
+            skipped=False,
+            summary=summary,
+        )
+
+    except Exception as e:
+        logger.error(f"Tonal outlier detection error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tonal outlier detection failed: {str(e)}"
+        )
 
 @app.get("/model-info")
 async def get_model_info():
