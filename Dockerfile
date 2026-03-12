@@ -18,7 +18,7 @@ COPY pyproject.toml /app/pyproject.toml
 RUN uv sync
 
 # Copy application code
-COPY main.py feature_extractor.py ./
+COPY main.py feature_extractor.py endpoints.py models.py helpers.py endpoints.py dependencies.py ./
 COPY models ./models
 
 EXPOSE 8000

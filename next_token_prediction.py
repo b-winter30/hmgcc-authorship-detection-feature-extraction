@@ -1,7 +1,16 @@
 """
 Next-Token Prediction Anomaly Detection (Stage 2)
 Detects token-level anomalies using language model predictions
-WITH HYBRID CONTEXT WEIGHTING (Position + TF-IDF Novelty)
+WITH CONTEXT WEIGHTING and SUSPICION SCORING
+
+Anomaly detection uses a multi-factor suspicion score (0-10) that considers:
+- Token probability (how unlikely was this token?)
+- Probability ratio (how much better was the expected token?)
+- Rank (how far down the prediction list?)
+- Capitalisation (potential entity/name?)
+
+This score is then weighted by positional context weight, and tokens
+with weighted_suspicion > suspicion_threshold (default 7.0) are flagged.
 """
 
 import numpy as np
@@ -17,25 +26,26 @@ logger = logging.getLogger(__name__)
 class NextTokenAnomalyDetector:
     """
     Detect token-level anomalies using next-token prediction
-    WITH HYBRID CONTEXT WEIGHTING (Position + TF-IDF Novelty)
+    WITH CONTEXT WEIGHTING and SUSPICION SCORING
     
     This is Stage 2 anomaly detection - operates at the token level
     to detect unusual word choices, potential name substitutions, etc.
     
-    Context weighting ensures that anomalies detected with more context
-    (later in the text) are weighted more heavily than anomalies detected
-    with minimal context (early in the text).
+    Anomaly flagging uses a multi-factor suspicion score (0-10) combined
+    with positional context weighting. This avoids the problem of raw
+    probability thresholds flagging too many normal tokens (since most
+    tokens have low probability in large-vocabulary models).
     """
     
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-8B",
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        anomaly_threshold: float = 0.05,
+        suspicion_threshold: float = 7.0,
         use_flash_attention: bool = False,
         cache_dir: Optional[str] = None,
         use_context_weighting: bool = True,
-        context_weighting_mode: str = "hybrid"  # "position", "tfidf", or "hybrid"
+        context_weighting_mode: str = "position"  # "position", "tfidf", or "hybrid"
     ):
         """
         Initialize the next-token anomaly detector
@@ -43,7 +53,8 @@ class NextTokenAnomalyDetector:
         Args:
             model_name: HuggingFace model identifier
             device: 'cuda' or 'cpu'
-            anomaly_threshold: Probability threshold for flagging anomalies
+            suspicion_threshold: Weighted suspicion score threshold (0-10) for
+                                 flagging anomalies. Default 7.0 matches notebook.
             use_flash_attention: Use Flash Attention 2 if available
             cache_dir: Directory to cache models
             use_context_weighting: Enable context-aware weighting (default: True)
@@ -51,7 +62,7 @@ class NextTokenAnomalyDetector:
                                    or "hybrid" (both combined)
         """
         self.device = device
-        self.anomaly_threshold = anomaly_threshold
+        self.suspicion_threshold = suspicion_threshold
         self.model_name = model_name
         self.use_context_weighting = use_context_weighting
         self.context_weighting_mode = context_weighting_mode
@@ -97,35 +108,106 @@ class NextTokenAnomalyDetector:
         if use_context_weighting:
             logger.info(f"   Context weighting: ENABLED ({context_weighting_mode} mode)")
             if context_weighting_mode in ["position", "hybrid"]:
-                logger.info(f"     Position-based: peaks at 50% of text length")
+                logger.info(f"     Position-based: percentage of text length")
             if context_weighting_mode in ["tfidf", "hybrid"]:
                 logger.info(f"     TF-IDF novelty: weights unseen/rare tokens higher")
+        
+        logger.info(f"   Suspicion threshold: {suspicion_threshold}/10")
+    
+    # ── Suspicion scoring (ported from notebook) ─────────────────────────────
+    
+    def _calculate_raw_suspicion(
+        self,
+        actual_prob: float,
+        expected_prob: float,
+        rank: int,
+        is_capitalized: bool
+    ) -> float:
+        """
+        Calculate raw suspicion score 0-10 (before context weighting).
+        
+        Ported from ContextAwareTamperingDetector notebook.
+        
+        Combines four factors:
+        - Factor 1: How low is actual probability? (0-5 points)
+        - Factor 2: How much better is expected token? (0-4 points)
+        - Factor 3: Rank position (0-2 points)
+        - Factor 4: Is capitalised / potential entity? (0-0.5 points)
+        """
+        score = 0.0
+        
+        # Factor 1: How low is actual probability? (0-5 points)
+        if actual_prob < 0.00001:
+            score += 5.0
+        elif actual_prob < 0.0001:
+            score += 4.5
+        elif actual_prob < 0.0005:
+            score += 4.0
+        elif actual_prob < 0.001:
+            score += 3.0
+        elif actual_prob < 0.005:
+            score += 2.0
+        elif actual_prob < 0.01:
+            score += 1.5
+        elif actual_prob < 0.05:
+            score += 1.0
+        elif actual_prob < 0.1:
+            score += 0.5
+        
+        # Factor 2: How much better is expected? (0-4 points)
+        prob_ratio = actual_prob / (expected_prob + 1e-10)
+        if prob_ratio < 0.00001:
+            score += 4.0
+        elif prob_ratio < 0.0001:
+            score += 3.5
+        elif prob_ratio < 0.0005:
+            score += 3.0
+        elif prob_ratio < 0.001:
+            score += 2.5
+        elif prob_ratio < 0.005:
+            score += 2.0
+        elif prob_ratio < 0.01:
+            score += 1.5
+        elif prob_ratio < 0.1:
+            score += 1.0
+        elif prob_ratio < 0.5:
+            score += 0.5
+        
+        # Factor 3: Rank position (0-2 points)
+        if rank > 1000:
+            score += 2.0
+        elif rank > 100:
+            score += 1.5
+        elif rank > 10:
+            score += 1.0
+        
+        # Factor 4: Is capitalised (0-0.5 points)
+        if is_capitalized:
+            score += 0.5
+        
+        return min(10.0, score)
+    
+    # ── Context weighting ────────────────────────────────────────────────────
     
     def calculate_positional_weight(self, position: int, total_tokens: int) -> float:
         """
-        Calculate position-based context weight
-        
-        Peaks at 50% of text length (middle of document)
+        Calculate position-based context weight using percentage of text length.
         
         Logic:
-        - 0% to 25%: weight 0.0 → 0.5 (building context)
-        - 25% to 50%: weight 0.5 → 1.0 (peak context)
+        - 0% to 25%:   weight 0.0 → 0.5 (building context)
+        - 25% to 50%:  weight 0.5 → 1.0 (peak context)
         - 50% to 100%: weight 1.0 (maintain full context)
         """
         if not self.use_context_weighting:
             return 1.0
         
-        # Calculate percentage through text
         pct = position / total_tokens if total_tokens > 0 else 0.0
         
         if pct < 0.25:
-            # First quarter: linear ramp 0.0 → 0.5
             return pct / 0.25 * 0.5
         elif pct < 0.50:
-            # Second quarter: linear ramp 0.5 → 1.0
             return 0.5 + ((pct - 0.25) / 0.25) * 0.5
         else:
-            # Second half: full context
             return 1.0
     
     def calculate_tfidf_novelty_weight(
@@ -143,57 +225,38 @@ class NextTokenAnomalyDetector:
         - Rare tokens in the document
         - Important/content words
         
-        Args:
-            token: The decoded token string
-            token_freq: Dictionary of token -> frequency in document so far
-            total_tokens_seen: Total tokens processed so far
-            is_first_occurrence: Whether this is the first time we've seen this token
-        
         Returns:
             Weight from 0.5 (common/repeated) to 1.0 (novel/rare)
         """
         if not self.use_context_weighting:
             return 1.0
         
-        # Clean token
         token_clean = token.strip().lower()
         
         if not token_clean:
-            return 0.5  # Empty tokens get low weight
+            return 0.5
         
-        # Get current frequency
         freq = token_freq.get(token_clean, 0)
         
-        # Calculate term frequency (TF)
-        # More frequent = lower novelty
         if total_tokens_seen > 0:
             tf = freq / total_tokens_seen
         else:
             tf = 0.0
         
-        # Base weight calculation
         if is_first_occurrence:
-            # First occurrence: HIGH novelty
             base_weight = 1.0
         elif freq == 1:
-            # Second occurrence: still novel
             base_weight = 0.95
         elif freq <= 3:
-            # Rare (2-3 occurrences)
             base_weight = 0.85
         elif freq <= 5:
-            # Uncommon (4-5 occurrences)
             base_weight = 0.75
         else:
-            # Common (6+ occurrences)
-            # Exponential decay
             base_weight = max(0.5, 0.75 * np.exp(-0.1 * (freq - 5)))
         
-        # Boost for capitalized words (likely names/entities)
         if token.strip() and token.strip()[0].isupper() and len(token.strip()) > 1:
             base_weight = min(1.0, base_weight * 1.1)
         
-        # Penalize very short tokens (likely function words)
         if len(token_clean) <= 2:
             base_weight *= 0.8
         
@@ -209,16 +272,11 @@ class NextTokenAnomalyDetector:
         is_first_occurrence: bool
     ) -> float:
         """
-        Calculate hybrid context weight combining position and TF-IDF novelty
+        Calculate context weight based on selected mode.
         
-        Formula:
-        hybrid_weight = positional_weight * novelty_weight
-        
-        This means:
-        - Early in text + common word = very low weight
-        - Early in text + novel word = low-medium weight
-        - Middle of text + common word = medium weight
-        - Middle of text + novel word = HIGH weight (best signal!)
+        In "position" mode: purely positional.
+        In "tfidf" mode: purely novelty-based.
+        In "hybrid" mode: positional * novelty (both must be high).
         """
         if self.context_weighting_mode == "position":
             return self.calculate_positional_weight(position, total_tokens)
@@ -233,12 +291,12 @@ class NextTokenAnomalyDetector:
             novelty_weight = self.calculate_tfidf_novelty_weight(
                 token, token_freq, total_tokens_seen, is_first_occurrence
             )
-            
-            # Combine: both must be high for maximum weight
             return pos_weight * novelty_weight
         
         else:
             return 1.0
+    
+    # ── Main analysis methods ────────────────────────────────────────────────
     
     def extract_anomaly_features(
         self,
@@ -247,7 +305,7 @@ class NextTokenAnomalyDetector:
         return_detailed: bool = False
     ) -> Dict[str, float]:
         """
-        Extract anomaly detection features from text
+        Extract anomaly detection features from text.
         
         This is the main method called by feature_extractor.py
         
@@ -259,7 +317,6 @@ class NextTokenAnomalyDetector:
         Returns:
             Dictionary of anomaly features suitable for ML pipeline
         """
-        # Tokenize with truncation
         tokens = self.tokenizer.encode(
             text,
             return_tensors="pt",
@@ -270,10 +327,7 @@ class NextTokenAnomalyDetector:
         if len(tokens[0]) < 2:
             return self._empty_features()
         
-        # Analyze tokens
         results = self._analyze_tokens(tokens)
-        
-        # Extract aggregate features
         features = self._compute_aggregate_features(results)
         
         if return_detailed:
@@ -283,7 +337,14 @@ class NextTokenAnomalyDetector:
     
     def _analyze_tokens(self, tokens: torch.Tensor) -> List[Dict]:
         """
-        Analyze each token in the sequence WITH HYBRID CONTEXT WEIGHTING
+        Analyze each token using suspicion scoring + context weighting.
+        
+        For each token:
+        1. Get model's prediction and actual token probability
+        2. Calculate raw suspicion (0-10) from probability, ratio, rank, capitalisation
+        3. Calculate context weight from position (and optionally novelty)
+        4. weighted_suspicion = raw_suspicion * context_weight
+        5. is_anomaly = weighted_suspicion > suspicion_threshold
         
         Returns:
             List of per-token analysis results
@@ -312,13 +373,17 @@ class NextTokenAnomalyDetector:
                 # Get top predictions
                 top_k_probs, top_k_indices = torch.topk(probs, k=10)
                 
+                # Expected token (top-1 prediction)
+                expected_prob = top_k_probs[0].item()
+                
                 # Decode token
                 try:
-                    actual_token = self.tokenizer.decode([actual_token_id], skip_special_tokens=False)
-                    actual_token = actual_token.strip() if actual_token.strip() else actual_token
+                    actual_token_raw = self.tokenizer.decode([actual_token_id], skip_special_tokens=False)
+                    actual_token = actual_token_raw.strip() if actual_token_raw.strip() else actual_token_raw
                 except Exception as e:
                     logger.warning(f"Token decode error at position {i}: {e}")
-                    actual_token = f"<TOKEN_{actual_token_id}>"
+                    actual_token_raw = f"<TOKEN_{actual_token_id}>"
+                    actual_token = actual_token_raw
                 
                 # Update token frequency tracking
                 token_clean = actual_token.strip().lower()
@@ -328,7 +393,7 @@ class NextTokenAnomalyDetector:
                     token_freq[token_clean] = token_freq.get(token_clean, 0) + 1
                     total_tokens_seen += 1
                 
-                # Calculate hybrid context weight
+                # Calculate context weight
                 context_weight = self.calculate_hybrid_weight(
                     position=i,
                     total_tokens=total_tokens,
@@ -338,7 +403,7 @@ class NextTokenAnomalyDetector:
                     is_first_occurrence=is_first_occurrence
                 )
                 
-                # Also calculate individual components for analysis
+                # Individual weight components for analysis
                 positional_weight = self.calculate_positional_weight(i, total_tokens)
                 novelty_weight = self.calculate_tfidf_novelty_weight(
                     actual_token, token_freq, total_tokens_seen, is_first_occurrence
@@ -348,21 +413,52 @@ class NextTokenAnomalyDetector:
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True)
                 actual_rank = (sorted_indices == actual_token_id).nonzero(as_tuple=True)[0].item() + 1
                 
-                # Calculate anomaly scores
-                base_anomaly_score = 1.0 - actual_token_prob
-                weighted_anomaly_score = base_anomaly_score * context_weight
-                
-                # Determine if anomaly using weighted score
-                is_anomaly = weighted_anomaly_score > (1.0 - self.anomaly_threshold)
+                # Is capitalised?
+                is_capitalized = bool(actual_token.strip() and actual_token.strip()[0].isupper())
                 
                 # Check if token contains emoji
                 contains_emoji = self._contains_emoji(actual_token)
+                
+                # Skip punctuation and very short tokens for suspicion scoring
+                # (matches notebook behaviour: tokens < 2 chars are not interesting
+                # for tampering detection). They still appear in the token stream
+                # but won't be flagged as anomalies.
+                token_stripped = actual_token.strip()
+                is_punctuation = (
+                    not token_stripped or
+                    len(token_stripped) < 2 or
+                    all(not c.isalnum() for c in token_stripped)
+                )
+                
+                if is_punctuation:
+                    raw_suspicion = 0.0
+                    weighted_suspicion = 0.0
+                    is_anomaly = False
+                else:
+                    # Calculate suspicion scores
+                    raw_suspicion = self._calculate_raw_suspicion(
+                        actual_prob=actual_token_prob,
+                        expected_prob=expected_prob,
+                        rank=actual_rank,
+                        is_capitalized=is_capitalized
+                    )
+                    weighted_suspicion = raw_suspicion * context_weight
+                    
+                    # Anomaly flag based on weighted suspicion threshold
+                    is_anomaly = weighted_suspicion > self.suspicion_threshold
+                
+                # Legacy scores (kept for ML feature compatibility)
+                base_anomaly_score = 1.0 - actual_token_prob
+                weighted_anomaly_score = base_anomaly_score * context_weight
                 
                 results.append({
                     'position': i,
                     'token': actual_token,
                     'probability': actual_token_prob,
+                    'expected_prob': expected_prob,
                     'rank': actual_rank,
+                    'raw_suspicion': raw_suspicion,
+                    'weighted_suspicion': weighted_suspicion,
                     'anomaly_score': base_anomaly_score,
                     'weighted_anomaly_score': weighted_anomaly_score,
                     'context_weight': context_weight,
@@ -371,9 +467,12 @@ class NextTokenAnomalyDetector:
                     'is_first_occurrence': is_first_occurrence,
                     'token_frequency': token_freq.get(token_clean, 0),
                     'is_anomaly': is_anomaly,
-                    'is_capitalized': actual_token.strip() and actual_token.strip()[0].isupper(),
+                    'is_punctuation': is_punctuation,
+                    'is_capitalized': is_capitalized,
                     'token_length': len(actual_token.strip()),
-                    'contains_emoji': contains_emoji
+                    'contains_emoji': contains_emoji,
+                    'token_raw': actual_token_raw,
+'token_id': actual_token_id,
                 })
         
         return results
@@ -384,20 +483,12 @@ class NextTokenAnomalyDetector:
             import emoji
             return emoji.emoji_count(text) > 0
         except ImportError:
-            # Fallback: check Unicode ranges for common emoji blocks
             emoji_ranges = [
-                (0x1F600, 0x1F64F),  # Emoticons
-                (0x1F300, 0x1F5FF),  # Misc Symbols and Pictographs
-                (0x1F680, 0x1F6FF),  # Transport and Map
-                (0x1F1E0, 0x1F1FF),  # Flags
-                (0x2600, 0x26FF),    # Misc symbols
-                (0x2700, 0x27BF),    # Dingbats
-                (0xFE00, 0xFE0F),    # Variation Selectors
-                (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
-                (0x1FA00, 0x1FA6F),  # Chess Symbols
-                (0x1FA70, 0x1FAFF),  # Symbols and Pictographs Extended-A
+                (0x1F600, 0x1F64F), (0x1F300, 0x1F5FF), (0x1F680, 0x1F6FF),
+                (0x1F1E0, 0x1F1FF), (0x2600, 0x26FF), (0x2700, 0x27BF),
+                (0xFE00, 0xFE0F), (0x1F900, 0x1F9FF), (0x1FA00, 0x1FA6F),
+                (0x1FA70, 0x1FAFF),
             ]
-            
             for char in text:
                 code_point = ord(char)
                 for start, end in emoji_ranges:
@@ -405,11 +496,14 @@ class NextTokenAnomalyDetector:
                         return True
             return False
     
+    # ── Aggregate feature computation ────────────────────────────────────────
+    
     def _compute_aggregate_features(self, results: List[Dict]) -> Dict[str, float]:
         """
-        Compute aggregate features from token-level analysis WITH HYBRID WEIGHTING
+        Compute aggregate features from token-level analysis.
         
-        These features are designed to integrate into the ML pipeline
+        Includes both suspicion-based and probability-based features
+        for the ML pipeline.
         """
         if not results:
             return self._empty_features()
@@ -417,24 +511,26 @@ class NextTokenAnomalyDetector:
         probs = [r['probability'] for r in results]
         anomaly_scores = [r['anomaly_score'] for r in results]
         weighted_anomaly_scores = [r['weighted_anomaly_score'] for r in results]
+        raw_suspicions = [r['raw_suspicion'] for r in results]
+        weighted_suspicions = [r['weighted_suspicion'] for r in results]
         context_weights = [r['context_weight'] for r in results]
         positional_weights = [r['positional_weight'] for r in results]
         novelty_weights = [r['novelty_weight'] for r in results]
         ranks = [r['rank'] for r in results]
         
-        # Count anomalies (using weighted scores)
+        # Count anomalies (using suspicion threshold)
         anomalies = [r for r in results if r['is_anomaly']]
         capitalized_anomalies = [r for r in anomalies if r['is_capitalized']]
         first_occurrence_anomalies = [r for r in anomalies if r['is_first_occurrence']]
         
         features = {
-            # Core statistics
+            # Core probability statistics
             'ntp_mean_probability': np.mean(probs),
             'ntp_median_probability': np.median(probs),
             'ntp_min_probability': np.min(probs),
             'ntp_std_probability': np.std(probs),
             
-            # Anomaly counts (now using weighted scores)
+            # Anomaly counts (suspicion-threshold based)
             'ntp_anomaly_ratio': len(anomalies) / len(results),
             'ntp_anomaly_count': len(anomalies),
             'ntp_capitalized_anomaly_ratio': len(capitalized_anomalies) / len(results),
@@ -445,11 +541,17 @@ class NextTokenAnomalyDetector:
             'ntp_median_rank': np.median(ranks),
             'ntp_max_rank': np.max(ranks),
             
-            # Anomaly score statistics - both raw and weighted
+            # Legacy anomaly score statistics (probability-based)
             'ntp_mean_anomaly_score': np.mean(anomaly_scores),
             'ntp_max_anomaly_score': np.max(anomaly_scores),
             'ntp_mean_weighted_anomaly_score': np.mean(weighted_anomaly_scores),
             'ntp_max_weighted_anomaly_score': np.max(weighted_anomaly_scores),
+            
+            # Suspicion score statistics (from notebook)
+            'ntp_mean_raw_suspicion': np.mean(raw_suspicions),
+            'ntp_max_raw_suspicion': np.max(raw_suspicions),
+            'ntp_mean_weighted_suspicion': np.mean(weighted_suspicions),
+            'ntp_max_weighted_suspicion': np.max(weighted_suspicions),
             
             # Context weight statistics
             'ntp_mean_context_weight': np.mean(context_weights),
@@ -472,12 +574,11 @@ class NextTokenAnomalyDetector:
             'ntp_very_high_rank_ratio': sum(1 for r in ranks if r > 1000) / len(ranks),
         }
         
-        # Context-aware features - split by POSITIONAL context quality
+        # Context-aware features - split by positional segment
         first_quarter = [r for r in results if r['position'] / len(results) < 0.25]
         second_quarter = [r for r in results if 0.25 <= r['position'] / len(results) < 0.5]
         second_half = [r for r in results if r['position'] / len(results) >= 0.5]
         
-        # Statistics for each positional segment
         for name, subset in [
             ('first_quarter', first_quarter),
             ('second_quarter', second_quarter),
@@ -493,12 +594,11 @@ class NextTokenAnomalyDetector:
                 features[f'ntp_{name}_anomaly_ratio'] = 0.0
         
         # High-weight anomaly features (most reliable indicators)
-        # Tokens with BOTH high positional weight AND high novelty
         high_weight_tokens = [r for r in results if r['context_weight'] >= 0.7]
         if high_weight_tokens:
             high_weight_anomalies = [r for r in high_weight_tokens if r['is_anomaly']]
             features['ntp_high_weight_anomaly_ratio'] = len(high_weight_anomalies) / len(high_weight_tokens)
-            features['ntp_high_weight_mean_weighted_score'] = np.mean([r['weighted_anomaly_score'] for r in high_weight_tokens])
+            features['ntp_high_weight_mean_weighted_score'] = np.mean([r['weighted_suspicion'] for r in high_weight_tokens])
         else:
             features['ntp_high_weight_anomaly_ratio'] = 0.0
             features['ntp_high_weight_mean_weighted_score'] = 0.0
@@ -533,6 +633,10 @@ class NextTokenAnomalyDetector:
             'ntp_max_anomaly_score': 0.0,
             'ntp_mean_weighted_anomaly_score': 0.0,
             'ntp_max_weighted_anomaly_score': 0.0,
+            'ntp_mean_raw_suspicion': 0.0,
+            'ntp_max_raw_suspicion': 0.0,
+            'ntp_mean_weighted_suspicion': 0.0,
+            'ntp_max_weighted_suspicion': 0.0,
             'ntp_mean_context_weight': 0.0,
             'ntp_min_context_weight': 0.0,
             'ntp_max_context_weight': 0.0,
@@ -545,7 +649,6 @@ class NextTokenAnomalyDetector:
             'ntp_very_high_rank_ratio': 0.0,
         }
         
-        # Add positional segment features
         for name in ['first_quarter', 'second_quarter', 'second_half']:
             base_features[f'ntp_{name}_mean_prob'] = 1.0
             base_features[f'ntp_{name}_anomaly_ratio'] = 0.0
@@ -557,17 +660,16 @@ class NextTokenAnomalyDetector:
         
         return base_features
     
+    # ── Visualization ────────────────────────────────────────────────────────
+    
     def visualize_anomalies(
         self,
         text: str,
         max_length: int = 512
     ) -> None:
         """
-        Print colored visualization of token-level anomalies
-        
-        Useful for debugging and understanding what the model detects
+        Print colored visualization of token-level anomalies.
         """
-        # Tokenize
         tokens = self.tokenizer.encode(
             text,
             return_tensors="pt",
@@ -582,43 +684,39 @@ class NextTokenAnomalyDetector:
         results = self._analyze_tokens(tokens)
         
         print("\n" + "="*80)
-        print("NEXT-TOKEN PREDICTION ANOMALY DETECTION (HYBRID CONTEXT-WEIGHTED)")
+        print("NEXT-TOKEN PREDICTION ANOMALY DETECTION (Suspicion-Scored)")
         print("="*80)
         
         print("\nColor Legend:")
-        print(f"{Fore.GREEN}Green{Style.RESET_ALL}: High confidence (p > 0.5)")
-        print(f"{Fore.YELLOW}Yellow{Style.RESET_ALL}: Medium confidence (0.1 < p < 0.5)")
-        print(f"{Fore.RED}Red{Style.RESET_ALL}: Low confidence / ANOMALY (p < 0.1)")
+        print(f"{Fore.GREEN}Green{Style.RESET_ALL}: Low suspicion (weighted < 3)")
+        print(f"{Fore.YELLOW}Yellow{Style.RESET_ALL}: Medium suspicion (3-7)")
+        print(f"{Fore.RED}Red{Style.RESET_ALL}: High suspicion / ANOMALY (> {self.suspicion_threshold})")
         
         if self.use_context_weighting:
             print(f"\n{Fore.CYAN}Context Weighting: {self.context_weighting_mode.upper()}{Style.RESET_ALL}")
-            print("  Anomalies with high positional + novelty weight are most reliable")
+            print(f"  Suspicion threshold: {self.suspicion_threshold}/10")
         
         print("\n" + "-"*80)
         
-        # Print tokens with color coding
+        # Print tokens with color coding based on weighted suspicion
         line_length = 0
         for r in results:
-            prob = r['probability']
+            ws = r['weighted_suspicion']
             token = r['token']
-            context_weight = r['context_weight']
             
-            # Color based on probability
-            if prob > 0.5:
-                color = Fore.GREEN
-            elif prob > 0.1:
+            if ws > self.suspicion_threshold:
+                color = Fore.RED
+            elif ws > 3.0:
                 color = Fore.YELLOW
             else:
-                color = Fore.RED
+                color = Fore.GREEN
             
-            # Add context weight indicator for anomalies
             if r['is_anomaly'] and self.use_context_weighting:
-                weight_indicator = f"[cw:{context_weight:.2f}]"
-                print(f"{color}{token}{weight_indicator}{Style.RESET_ALL}", end="")
+                indicator = f"[{ws:.1f}]"
+                print(f"{color}{token}{indicator}{Style.RESET_ALL}", end="")
             else:
                 print(f"{color}{token}{Style.RESET_ALL}", end="")
             
-            # Word wrap at 80 chars
             line_length += len(token)
             if line_length > 80:
                 print()
@@ -626,53 +724,49 @@ class NextTokenAnomalyDetector:
         
         print("\n" + "-"*80)
         
-        # Print flagged tokens with context awareness
+        # Print flagged tokens
         flagged = [r for r in results if r['is_anomaly']]
         if flagged:
-            print(f"\n🚨 {len(flagged)} ANOMALOUS TOKENS DETECTED (hybrid context-weighted):")
-            for r in flagged:
+            print(f"\n🚨 {len(flagged)} ANOMALOUS TOKENS (weighted suspicion > {self.suspicion_threshold}):")
+            for r in sorted(flagged, key=lambda x: x['weighted_suspicion'], reverse=True):
                 print(f"\n  Position {r['position']}: '{r['token'].strip()}'")
                 print(f"    Probability: {r['probability']:.6f} (Rank: #{r['rank']})")
-                print(f"    Base anomaly score: {r['anomaly_score']:.4f}")
+                print(f"    Expected top-1 prob: {r['expected_prob']:.6f}")
+                print(f"    Raw suspicion: {r['raw_suspicion']:.2f}/10")
                 if self.use_context_weighting:
-                    print(f"    Positional weight: {r['positional_weight']:.4f}")
-                    print(f"    Novelty weight: {r['novelty_weight']:.4f}")
-                    print(f"    Combined context weight: {r['context_weight']:.4f}")
-                    print(f"    Weighted anomaly score: {r['weighted_anomaly_score']:.4f}")
-                    if r['is_first_occurrence']:
-                        print(f"    ⭐ First occurrence (novel token!)")
+                    print(f"    Context weight: {r['context_weight']:.4f} (pos: {r['positional_weight']:.4f}, nov: {r['novelty_weight']:.4f})")
+                    print(f"    Weighted suspicion: {r['weighted_suspicion']:.2f}/10")
+                if r['is_capitalized']:
+                    print(f"    ⚠️  Capitalised token (potential entity)")
+                if r['is_first_occurrence']:
+                    print(f"    ⭐ First occurrence (novel token)")
         else:
             print("\n✅ No anomalies detected")
         
         # Statistics
         probs = [r['probability'] for r in results]
-        weighted_scores = [r['weighted_anomaly_score'] for r in results]
-        context_weights = [r['context_weight'] for r in results]
-        novelty_weights = [r['novelty_weight'] for r in results]
+        raw_sus = [r['raw_suspicion'] for r in results]
+        weighted_sus = [r['weighted_suspicion'] for r in results]
         
         print(f"\n📊 Statistics:")
         print(f"   Mean probability: {np.mean(probs):.4f}")
         print(f"   Median probability: {np.median(probs):.4f}")
-        print(f"   Min probability: {np.min(probs):.4f}")
+        print(f"   Min probability: {np.min(probs):.6f}")
+        print(f"   Mean raw suspicion: {np.mean(raw_sus):.2f}/10")
+        print(f"   Max raw suspicion: {np.max(raw_sus):.2f}/10")
+        print(f"   Mean weighted suspicion: {np.mean(weighted_sus):.2f}/10")
+        print(f"   Max weighted suspicion: {np.max(weighted_sus):.2f}/10")
         print(f"   Tokens flagged: {len(flagged)} / {len(results)} ({len(flagged)/len(results)*100:.1f}%)")
-        
-        if self.use_context_weighting:
-            print(f"\n   Hybrid context weighting:")
-            print(f"     Mean context weight: {np.mean(context_weights):.4f}")
-            print(f"     Mean novelty weight: {np.mean(novelty_weights):.4f}")
-            print(f"     Mean weighted anomaly score: {np.mean(weighted_scores):.4f}")
-            print(f"     Max weighted anomaly score: {np.max(weighted_scores):.4f}")
 
 
 def get_ntp_feature_names() -> List[str]:
     """
-    Get list of feature names produced by NextTokenAnomalyDetector
-    WITH HYBRID CONTEXT WEIGHTING
+    Get list of feature names produced by NextTokenAnomalyDetector.
     
-    Useful for feature engineering pipelines
+    Includes both legacy probability-based and new suspicion-based features.
     """
     return [
-        # Core features
+        # Core probability features
         'ntp_mean_probability',
         'ntp_median_probability',
         'ntp_min_probability',
@@ -684,11 +778,16 @@ def get_ntp_feature_names() -> List[str]:
         'ntp_mean_rank',
         'ntp_median_rank',
         'ntp_max_rank',
-        # Anomaly scores
+        # Legacy anomaly scores (probability-based)
         'ntp_mean_anomaly_score',
         'ntp_max_anomaly_score',
         'ntp_mean_weighted_anomaly_score',
         'ntp_max_weighted_anomaly_score',
+        # Suspicion scores (from notebook)
+        'ntp_mean_raw_suspicion',
+        'ntp_max_raw_suspicion',
+        'ntp_mean_weighted_suspicion',
+        'ntp_max_weighted_suspicion',
         # Context weights
         'ntp_mean_context_weight',
         'ntp_min_context_weight',
@@ -728,12 +827,12 @@ if __name__ == "__main__":
     print(f"   PyTorch: {torch.__version__}")
     print(f"   CUDA Available: {torch.cuda.is_available()}")
     
-    # Initialize detector with hybrid context weighting
+    # Initialize detector with suspicion scoring
     detector = NextTokenAnomalyDetector(
         model_name="Qwen/Qwen3-8B",
-        anomaly_threshold=0.01,
+        suspicion_threshold=7.0,
         use_context_weighting=True,
-        context_weighting_mode="hybrid"  # Use hybrid mode
+        context_weighting_mode="position"
     )
     
     # Test text
@@ -749,7 +848,7 @@ if __name__ == "__main__":
     """
     
     print("\n" + "="*80)
-    print("TEST: Extracting Features with Hybrid Context Weighting")
+    print("TEST: Suspicion-Scored Anomaly Detection")
     print("="*80)
     
     # Extract features (for ML pipeline)
