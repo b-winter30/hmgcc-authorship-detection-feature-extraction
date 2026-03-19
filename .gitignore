@@ -1,10 +1,12 @@
 # Python-generated files
+.python-version
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+api_activity.log
 
 # Virtual environments
 .venv
